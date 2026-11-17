@@ -20,7 +20,7 @@ from typing import List
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from . import catalog
+from . import catalog, integrity
 from .config import (
     FIXED_COLUMNS,
     INDICATOR_COLUMN_PREFIX,
@@ -191,10 +191,15 @@ def ingest_upload(
         with open(tmp_path, "rb") as fh:
             os.fsync(fh.fileno())
 
+        # 完整性基线在落盘后立即计算，与分片登记在同一事务内提交：
+        # 要么“字节数 + SHA-256 + 登记行”一起生效，要么都不生效。
+        byte_size, sha256 = integrity.file_sha256_and_size(tmp_path)
+
         cur = conn.execute(
-            "INSERT INTO shards (version_id, file_path, row_count, original_name) "
-            "VALUES (?, ?, ?, ?)",
-            (version_id, tmp_path, n_rows, original_name),
+            "INSERT INTO shards "
+            "(version_id, file_path, row_count, original_name, byte_size, sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (version_id, tmp_path, n_rows, original_name, byte_size, sha256),
         )
         shard_id = int(cur.lastrowid)
         final_path = str(SHARD_DIR / f"shard-{shard_id:010d}.parquet")
@@ -207,9 +212,10 @@ def ingest_upload(
                 (shard_id, indicator_id),
             )
     except BaseException:
-        # 任何意外：清理临时文件，交由外层事务回滚
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        # 任何意外：清理临时文件，交由外层事务回滚（含已 rename 的正式文件）
+        for path in (tmp_path, locals().get("final_path")):
+            if path and os.path.exists(path):
+                os.unlink(path)
         raise
 
     return {
@@ -218,4 +224,6 @@ def ingest_upload(
         "row_count": n_rows,
         "stored_columns": [f"{INDICATOR_COLUMN_PREFIX}{i}" for i in present_indicator_ids],
         "file_path": final_path,
+        "byte_size": byte_size,
+        "sha256": sha256,
     }

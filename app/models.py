@@ -1,7 +1,7 @@
 """Pydantic 响应/请求模型与统一错误类型。"""
 from __future__ import annotations
 
-from typing import List
+from typing import List, Literal, Optional
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -12,6 +12,20 @@ class ConflictError(HTTPException):
 
     def __init__(self, detail: str) -> None:
         super().__init__(status_code=409, detail=detail)
+
+
+class IntegrityError(HTTPException):
+    """快照分片完整性核验失败（409）：整页拒绝，不返回任何部分行。"""
+
+    def __init__(self, snapshot_id: int, failures: List[dict]) -> None:
+        super().__init__(
+            status_code=409,
+            detail={
+                "message": "快照分片完整性核验失败，整页拒绝",
+                "snapshot_id": snapshot_id,
+                "shards": failures,
+            },
+        )
 
 
 class NotFound(HTTPException):
@@ -68,6 +82,33 @@ class UploadResponse(BaseModel):
     row_count: int
     stored_columns: List[str] = Field(..., description="分片实际落盘的指标身份列")
     file_path: str
+    byte_size: int = Field(..., description="登记的分片字节数，用于完整性核验")
+    sha256: str = Field(..., description="登记的分片 SHA-256，用于完整性核验")
+
+
+class ShardIntegrityStatus(BaseModel):
+    shard_id: int
+    original_name: str = Field(..., description="上传时的原始文件名")
+    position: int = Field(..., description="该分片在快照中的顺序")
+    status: Literal["ok", "missing", "digest_mismatch", "unverifiable"] = Field(
+        ...,
+        description=(
+            "ok=与登记一致；missing=文件不存在；digest_mismatch=字节数或 SHA-256 不符；"
+            "unverifiable=无可用基线（旧卷分片且结构/登记行数核对失败），不可供数"
+        ),
+    )
+    detail: Optional[str] = Field(None, description="异常说明；ok 时为 null")
+    byte_size: Optional[int] = Field(None, description="登记字节数；无基线为 null")
+    sha256: Optional[str] = Field(None, description="登记 SHA-256；无基线为 null")
+    baseline_created: bool = Field(False, description="本次核验是否为旧卷分片补建了基线")
+
+
+class SnapshotIntegrityOut(BaseModel):
+    snapshot_id: int
+    checked_at: str
+    all_ok: bool = Field(..., description="是否全部分片通过；为 false 时 /rows 会整页拒绝")
+    counts: dict = Field(..., description="各状态计数")
+    shards: List[ShardIntegrityStatus]
 
 
 class SnapshotMeta(BaseModel):

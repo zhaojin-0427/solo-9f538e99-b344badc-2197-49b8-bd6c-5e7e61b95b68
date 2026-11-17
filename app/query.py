@@ -15,10 +15,10 @@ import sqlite3
 from typing import List, Optional
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 
+from . import integrity
 from .config import FIXED_COLUMNS, INDICATOR_COLUMN_PREFIX, SAMPLED_AT_COLUMN, STATION_COLUMN
-from .models import ConflictError, NotFound
+from .models import ConflictError, IntegrityError, NotFound
 
 
 def create_snapshot(conn: sqlite3.Connection) -> dict:
@@ -89,16 +89,15 @@ def _format_timestamp(value) -> str:
 
 
 def _read_shard_window(
-    file_path: str,
+    table: pa.Table,
     indicator_ids: List[int],
     skip: int,
     take: int,
 ) -> list[dict]:
-    """读取单个分片的指定窗口，返回窗口行（已按站点、采样时刻稳定排序）。
+    """从**已核验的同一份分片字节**解析出的表读取窗口行（按站点、采样时刻稳定排序）。
 
     缺失的指标身份列补 NULL；只物化窗口区间，避免对无关分片全量读取。
     """
-    table = pq.read_table(file_path)
     shard_total = table.num_rows
 
     # 固定列
@@ -187,17 +186,27 @@ def query_page(
     if total_rows:
         offset = (page - 1) * page_size
         remaining = page_size
-        # 快照分片顺序固定；逐分片跳过/取窗
+        # 快照分片顺序固定；先据登记行数定位“本页实际会用到”的分片
         cumulative = 0
-        for shard_id in shard_ids:
-            shard_path = conn.execute(
-                "SELECT file_path, row_count FROM shards WHERE shard_id = ?",
-                (shard_id,),
+        used: list[tuple[int, int, int, int]] = []  # (shard_id, position, local_skip, local_take)
+        for position, shard_id in enumerate(shard_ids):
+            shard = conn.execute(
+                "SELECT * FROM shards WHERE shard_id = ?", (shard_id,)
             ).fetchone()
-            if shard_path is None:
-                # 快照引用的分片理论上不会被删；防御性处理
-                raise NotFound(f"快照引用的分片 {shard_id} 已丢失")
-            shard_total = shard_path["row_count"]
+            if shard is None:
+                raise IntegrityError(
+                    sid,
+                    [
+                        {
+                            "shard_id": shard_id,
+                            "original_name": None,
+                            "position": position,
+                            "status": integrity.STATUS_MISSING,
+                            "detail": "分片登记记录不存在",
+                        }
+                    ],
+                )
+            shard_total = shard["row_count"]
             start = cumulative
             end = cumulative + shard_total
             cumulative = end
@@ -206,11 +215,40 @@ def query_page(
                 continue
             local_skip = max(offset - start, 0)
             local_take = min(remaining, shard_total - local_skip)
-            part = _read_shard_window(
-                shard_path["file_path"], indicator_ids, local_skip, local_take
-            )
+            used.append((shard_id, position, local_skip, local_take))
+            remaining -= local_take
+
+        # 先对**本次实际使用**的每个分片做完整性核验；任一片异常即整页拒绝，
+        # 此时尚未产生任何行，绝不返回部分结果，也不改动快照。
+        failures: list[dict] = []
+        loaded: dict[int, tuple[pa.Table, int, int]] = {}
+        for shard_id, position, local_skip, local_take in used:
+            try:
+                data, _item = integrity.read_verified_bytes(conn, shard_id)
+                table = integrity.table_from_verified_bytes(shard_id, data)
+            except integrity.ShardIntegrityFailure as exc:
+                shard = conn.execute(
+                    "SELECT original_name FROM shards WHERE shard_id = ?", (shard_id,)
+                ).fetchone()
+                failures.append(
+                    {
+                        "shard_id": shard_id,
+                        "original_name": shard["original_name"] if shard else None,
+                        "position": position,
+                        "status": exc.status,
+                        "detail": exc.detail,
+                    }
+                )
+                continue
+            loaded[shard_id] = (table, local_skip, local_take)
+
+        if failures:
+            raise IntegrityError(sid, failures)
+
+        for shard_id, _position, _skip, _take in used:
+            table, local_skip, local_take = loaded[shard_id]
+            part = _read_shard_window(table, indicator_ids, local_skip, local_take)
             rows.extend(part)
-            remaining -= len(part)
 
     # 把身份列键替换为快照固化的当前指标名
     name_by_id = dict(zip(indicator_ids, indicator_names))

@@ -46,12 +46,16 @@ CREATE TABLE IF NOT EXISTS version_indicators (
 );
 
 -- Parquet 分片
+-- byte_size / sha256 是上传时登记的完整性基线；旧卷分片这两列为 NULL，
+-- 待首次核验通过“结构 + 登记行数”后才补建，补建前不可供数。
 CREATE TABLE IF NOT EXISTS shards (
     shard_id        INTEGER PRIMARY KEY AUTOINCREMENT,
     version_id      INTEGER NOT NULL REFERENCES schema_versions(version_id),
     file_path       TEXT NOT NULL UNIQUE,
     row_count       INTEGER NOT NULL CHECK (row_count >= 0),
     original_name   TEXT NOT NULL,
+    byte_size       INTEGER,
+    sha256          TEXT,
     uploaded_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -132,6 +136,7 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA_SQL)
+        _migrate_shard_integrity_columns(conn)
         row = conn.execute("SELECT COUNT(*) AS n FROM schema_versions").fetchone()
         if row["n"] == 0:
             conn.execute(
@@ -141,3 +146,21 @@ def init_db() -> None:
             conn.commit()
     finally:
         conn.close()
+
+
+def _migrate_shard_integrity_columns(conn: sqlite3.Connection) -> None:
+    """旧库升级：为既有 shards 表补 byte_size / sha256 列。
+
+    旧分片的基线保持 NULL，由完整性核验接口在结构与登记行数核对通过后补建；
+    补建前这些分片不可供数（/rows 整页拒绝）。
+    """
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(shards)").fetchall()
+    }
+    added = False
+    for column, decl in (("byte_size", "INTEGER"), ("sha256", "TEXT")):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE shards ADD COLUMN {column} {decl}")
+            added = True
+    if added:
+        conn.commit()

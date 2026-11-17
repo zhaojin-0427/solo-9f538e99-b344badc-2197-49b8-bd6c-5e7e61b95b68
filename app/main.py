@@ -15,7 +15,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from . import catalog, ingest, query
+from . import catalog, ingest, integrity, query
 from .config import FIXED_COLUMNS, MAX_INDICATORS
 from .db import connect, immediate_transaction, init_db
 from .models import (
@@ -26,6 +26,7 @@ from .models import (
     RenameRequest,
     RowPage,
     SchemaOut,
+    SnapshotIntegrityOut,
     SnapshotMeta,
     UploadResponse,
     VersionOut,
@@ -45,7 +46,9 @@ app = FastAPI(
         "固定站点 + UTC 采样时刻，至多 8 个可空浮点指标的化验表服务。\n\n"
         "- 指标有稳定身份，改名不换身份；同名复用是全新指标，不继承旧值。\n"
         "- 上传 Parquet 必须指定字段版；含已删指标或未知列整次拒绝。\n"
-        "- 首次查询固化字段与分片并返回快照号，之后任何变更/上传/重启都不影响该快照。"
+        "- 上传成功即登记字节数与 SHA-256；快照核验返回每片通过/缺失/摘要不符/不可校验。\n"
+        "- 旧卷分片在结构与登记行数核对通过后补建基线，核对失败前不可供数。\n"
+        "- /rows 只读取本次实际使用并核验通过的分片；任一片异常整页拒绝，不返回部分行。"
     ),
     lifespan=lifespan,
 )
@@ -235,6 +238,40 @@ def get_snapshot(snapshot_id: int, conn=Depends(get_conn)):
         created_at=meta["created_at"],
         indicator_names=meta["indicator_names"],
         shard_ids=meta["shard_ids"],
+    )
+
+
+@app.get(
+    "/snapshots/{snapshot_id}/integrity",
+    response_model=SnapshotIntegrityOut,
+    tags=["查询"],
+    summary="核验快照全部分片的完整性（旧卷分片核对通过后补建基线）",
+)
+def get_snapshot_integrity(
+    snapshot_id: int,
+    request: Request,
+    conn=Depends(get_conn),
+    lock=Depends(get_lock),
+):
+    """逐片返回 ok / missing / digest_mismatch / unverifiable 与上传原名。
+
+    旧卷分片在“可解析 + 固定列与登记指标列齐全 + 实际行数等于登记行数”全部
+    通过后，用当前字节补建基线（此后按摘要核验）；核对失败的分片保持无基线、
+    不可供数。补建基线只更新分片基线列，不触碰快照或任何数据行。
+    """
+    with lock, immediate_transaction(conn):
+        meta = query.get_snapshot_meta(conn, snapshot_id)  # 不存在 -> 404
+        results = integrity.check_snapshot(conn, snapshot_id, meta["shard_ids"])
+        checked_at = conn.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS t"
+        ).fetchone()["t"]
+    summary = integrity.counts(results)
+    return SnapshotIntegrityOut(
+        snapshot_id=snapshot_id,
+        checked_at=checked_at,
+        all_ok=summary[integrity.STATUS_OK] == len(results),
+        counts=summary,
+        shards=results,
     )
 
 

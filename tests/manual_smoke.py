@@ -96,6 +96,14 @@ def main() -> int:
     assert rejected.status_code == 409, rejected.text
     print("deleted-indicator upload rejected:", rejected.json()["detail"])
 
+    # 快照完整性核验：上传即登记基线，逐片 ok 并带原上传名
+    report = c.get(f"/snapshots/{snap}/integrity")
+    report.raise_for_status()
+    integrity = report.json()
+    assert integrity["all_ok"] is True
+    assert {s["original_name"] for s in integrity["shards"]} == {"h.parquet", "old.parquet", "new.parquet"}
+    print("integrity ok:", integrity["counts"])
+
     print("\nSMOKE OK")
     return 0
 
